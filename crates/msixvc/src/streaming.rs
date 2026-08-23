@@ -210,6 +210,15 @@ enum CacheWriteState {
     Idle,
     Seeking { offset: u64 },
     Writing,
+    // A write that tokio has accepted but not yet performed. tokio's File
+    // copies into its own buffer and runs the write on a blocking thread, so
+    // poll_write returns Ok(n) while the bytes are still in flight: counting
+    // them as cached there lets a read from cache_reader -- a second handle
+    // on the same path, whose read is dispatched to the same pool -- reach
+    // past the end of the file and come back empty ("cache ended before
+    // cached_len"). The bytes are only cached once the flush that performs
+    // that write has completed.
+    Flushing { written: u64 },
 }
 
 pub struct PrefixCacheFile<R> {
@@ -399,15 +408,33 @@ where
                         }
                         Poll::Ready(Ok(written)) => {
                             self.pending_chunk_offset += written;
-                            self.cached_len += written as u64;
                             self.cache_write_pos += written as u64;
+                            self.cache_write_state = CacheWriteState::Flushing {
+                                written: written as u64,
+                            };
+                        }
+                        Poll::Ready(Err(err)) => {
+                            self.cache_write_state = CacheWriteState::Idle;
+                            return Poll::Ready(Err(err));
+                        }
+                    }
+                }
+                CacheWriteState::Flushing { written } => {
+                    match AsyncWrite::poll_flush(Pin::new(&mut self.cache_writer), cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(())) => {
+                            // On disk now, so cache_reader can see it.
+                            self.cached_len += written;
                             if self.pending_chunk_offset >= chunk.len() {
                                 self.pending_chunk = None;
                                 self.pending_chunk_offset = 0;
-                                self.cache_write_state = CacheWriteState::Idle;
                             }
+                            self.cache_write_state = CacheWriteState::Idle;
                             return Poll::Ready(Ok(()));
                         }
+                        // A write refused for want of space fails here rather
+                        // than at the read it would otherwise cut short, so a
+                        // full disk says so in its own words.
                         Poll::Ready(Err(err)) => {
                             self.cache_write_state = CacheWriteState::Idle;
                             return Poll::Ready(Err(err));
@@ -852,6 +879,41 @@ mod tests {
 
         assert_eq!(&buf[..], &body[..64]);
         assert!(file.cached_len() >= 64);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[tokio::test]
+    async fn cached_prefix_never_reads_past_what_is_on_disk() {
+        // tokio performs a File write on a blocking thread and reports it
+        // accepted before it has happened, so counting those bytes as cached
+        // lets the read side -- a second handle whose read is dispatched to
+        // the same pool -- ask for bytes the file does not hold yet and get
+        // UnexpectedEof ("cache ended before cached_len"). It is a race, so
+        // this reads a body long enough to cross the boundary many times and
+        // checks the invariant the reader relies on after every step.
+        let body: Vec<u8> = (0..(4 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let server = spawn_server(body.clone(), None, 0).await.unwrap();
+        let cache = cache_path("write-visible");
+        let mut file = open_cached_reader(&server, &cache).await;
+
+        let mut buf = [0u8; 512];
+        let mut read = 0usize;
+        // The tail of the last upstream chunk is a separate matter; this is
+        // about what the cache reports as cached while a write is in flight.
+        let end = body.len() - 64 * 1024;
+        while read < end {
+            let want = buf.len().min(end - read);
+            file.read_exact(&mut buf[..want]).await.unwrap();
+            assert_eq!(&buf[..want], &body[read..read + want]);
+            let on_disk = std::fs::metadata(&cache).unwrap().len();
+            assert!(
+                on_disk >= file.cached_len(),
+                "cache counts {} bytes but only {on_disk} are on disk",
+                file.cached_len(),
+            );
+            read += want;
+        }
+
         let _ = std::fs::remove_file(cache);
     }
 
