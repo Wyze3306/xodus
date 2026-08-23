@@ -20,6 +20,13 @@ pub enum LicenseContentError {
     /// not covered by the account's current subscription tier).
     #[error("not entitled to this content: {description}")]
     NotEntitled { description: String },
+
+    /// The service answered with something this cannot read a license out of.
+    /// The content key is in there and nowhere else, so there is nothing to
+    /// fall back on -- but a downloader saying so is worth a great deal more
+    /// than one panicking in a library.
+    #[error("the license could not be read: {0}")]
+    Unreadable(String),
 }
 
 // we might need a bump in xal-rs concerning reqwest,
@@ -71,9 +78,7 @@ pub async fn get_license_content(
             });
         }
     };
-    let license = &content.keys[0].value;
-    let license = BASE64_STANDARD.decode(license).unwrap();
-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
+    let license = read_license(&content)?;
     Ok((content, license))
 }
 
@@ -111,4 +116,77 @@ pub async fn get_license_token(
     let token_resp: LicenseTokenResponse = response.json().await?;
 
     Ok(token_resp.license_token)
+}
+
+/// The license the response carries the content key in.
+///
+/// Base64, then UTF-8, then a license document: three ways for an answer to
+/// be something other than what was expected, and all three used to be
+/// unwrapped in the middle of a download.
+fn read_license(content: &LicenseContent) -> Result<License, LicenseContentError> {
+    let key = content
+        .keys
+        .first()
+        .ok_or_else(|| LicenseContentError::Unreadable("the response carried none".into()))?;
+    let decoded = BASE64_STANDARD
+        .decode(&key.value)
+        .map_err(|err| LicenseContentError::Unreadable(format!("not base64: {err}")))?;
+    let xml = String::from_utf8(decoded)
+        .map_err(|err| LicenseContentError::Unreadable(format!("not text: {err}")))?;
+    quick_xml::de::from_str::<License>(&xml)
+        .map_err(|err| LicenseContentError::Unreadable(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::licensing::LicenseKeys;
+
+    use super::*;
+
+    fn response(keys: Vec<&str>) -> LicenseContent {
+        LicenseContent {
+            keys: keys
+                .into_iter()
+                .map(|value| LicenseKeys {
+                    value: value.to_string(),
+                })
+                .collect(),
+            leases: vec![],
+        }
+    }
+
+    #[test]
+    fn reads_the_license_out_of_the_first_key() {
+        let xml = r#"<License>
+                       <SPLicenseBlock>AAAA</SPLicenseBlock>
+                       <LicenseInfo Type="Trial" LicenseUsage="Online"/>
+                       <Binding Binding_Type="Content"/>
+                     </License>"#;
+
+        let license = read_license(&response(vec![&BASE64_STANDARD.encode(xml)]))
+            .expect("failed to read the license");
+
+        assert_eq!(license.splicense_block, "AAAA");
+    }
+
+    #[test]
+    fn reports_a_response_with_no_license() {
+        let err = read_license(&response(vec![])).expect_err("expected no license");
+
+        assert!(
+            err.to_string().contains("could not be read"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reports_a_key_that_is_not_a_license() {
+        let err = read_license(&response(vec![&BASE64_STANDARD.encode("<Nope/>")]))
+            .expect_err("expected an unreadable license");
+
+        assert!(
+            err.to_string().contains("could not be read"),
+            "unexpected error: {err}"
+        );
+    }
 }
