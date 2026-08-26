@@ -110,12 +110,15 @@ impl WebviewRequest {
     }
 }
 
-pub fn login_request(client_id: String, market: String) -> WebviewRequest {
+/// The headers that tell login.live.com it is talking to the token broker.
+///
+/// They are what selects the CloudExperienceHost flow -- the one that drives
+/// the host bridge and ends by posting `ServerData` back through
+/// `ppsecure/post.srf`. Every page of a sign-in needs them, not just the
+/// first: served without them, the same URL renders the ordinary consumer
+/// page instead, which waits on a host that is never told about it.
+fn host_headers() -> HeaderMap {
     let uid = uuid::Uuid::new_v4();
-    let url = format!(
-        "https://login.live.com/ppsecure/InlineLogin.srf?id=80604&scid=3&mkt={market}&Platform=Windows10&clientid={client_id}&hosted=1"
-    );
-
     let mut headers = HeaderMap::new();
     headers.insert("cxh-capabilities", HeaderValue::from_static(r#"{"PrivatePropertyBag":1,"PasswordlessConnect":1,"PreferAssociate":1,"ChromelessUI":0}"#));
     headers.insert(
@@ -144,11 +147,28 @@ pub fn login_request(client_id: String, market: String) -> WebviewRequest {
         HeaderValue::from_static(r#"CloudExperienceHost"#),
     );
 
-    WebviewRequest::new("Xodus login", url, headers)
+    headers
 }
 
+pub fn login_request(client_id: String, market: String) -> WebviewRequest {
+    let url = format!(
+        "https://login.live.com/ppsecure/InlineLogin.srf?id=80604&scid=3&mkt={market}&Platform=Windows10&clientid={client_id}&hosted=1"
+    );
+
+    WebviewRequest::new("Xodus login", url, host_headers())
+}
+
+/// The second leg of a sign-in: the `inline_auth_url` a faulted token
+/// exchange hands back, opened in a session of its own.
+///
+/// It carries the same headers as the first leg. Opened without them the
+/// page has no way to know it is hosted, so login.live.com serves the
+/// consumer interrupt -- "Please wait" and a disabled OK button -- which
+/// never reaches `ppsecure/post.srf`. That URL is the only one
+/// `create_session` fires `Finish` on, so `ServerData` is never read back
+/// and the window sits there for as long as anyone leaves it open.
 pub fn finalize_request(url: String) -> WebviewRequest {
-    WebviewRequest::new("Xodus login", url, HeaderMap::new())
+    WebviewRequest::new("Xodus login", url, host_headers())
 }
 
 pub fn run_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>
@@ -392,5 +412,52 @@ fn remove_session<T: SessionHandler>(state: &mut RuntimeState<T>, session_id: Se
     if state.active_session == Some(session_id) {
         state.active_session = None;
         state.active_webview = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every leg of the sign-in has to look like the same host, or the leg
+    /// that does not never finishes.
+    #[test]
+    fn both_legs_of_a_sign_in_are_hosted_the_same_way() {
+        let first = login_request("000000004424da1f".to_string(), "en-US".to_string());
+        let second = finalize_request("https://login.live.com/ppsecure/inlineconnect.srf".to_string());
+
+        for name in [
+            "cxh-capabilities",
+            "cxh-msaBinaryVersion",
+            "cxh-identityClientBinaryVersion",
+            "cxh-osVersionInfo",
+            "cxh-platform",
+            "cxh-protocol",
+            "cxh-source",
+            "hostApp",
+        ] {
+            assert_eq!(
+                first.headers.get(name),
+                second.headers.get(name),
+                "{name} differs between the two legs of the sign-in"
+            );
+        }
+        assert_eq!(
+            first.headers.get("hostApp").unwrap().to_str().unwrap(),
+            "CloudExperienceHost"
+        );
+    }
+
+    /// The correlation id identifies one request, so it is the one header
+    /// that must *not* be carried over.
+    #[test]
+    fn each_request_gets_its_own_correlation_id() {
+        let first = host_headers();
+        let second = host_headers();
+
+        assert_ne!(
+            first.get("cxh-correlationId"),
+            second.get("cxh-correlationId")
+        );
     }
 }
