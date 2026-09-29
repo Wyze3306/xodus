@@ -3,6 +3,20 @@ use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::Token;
 use xodus::models::soap;
 use xodus::tokens::TokenManager;
+use xodus::tokens::store::TokenStoreError;
+
+/// What a license request says when the keyring lacks one of the entries it
+/// needs, instead of unwrapping it.
+///
+/// A keyring can hold device tokens and some user tokens without everything a
+/// license request reads -- the account's `user-DA` entry, or its Passport
+/// STS token -- and each lookup used to `unwrap()`, so the caller got
+/// `called Result::unwrap() on an Err value: NotFound` in the middle of a
+/// download, with nothing to say that signing in again is the way out.
+/// "not logged in" is the phrase for that.
+fn missing(what: &str, err: TokenStoreError) -> String {
+    format!("not logged in: {what} is missing from the keyring ({err}); sign in again")
+}
 
 pub async fn get_license(
     client: &reqwest::Client,
@@ -10,12 +24,18 @@ pub async fn get_license(
     content_id: String,
     market: String,
 ) -> std::result::Result<(DeviceKey, SPLicense), String> {
-    let dev_token = tokens.get_device_sts_token().unwrap();
+    let dev_token = tokens
+        .get_device_sts_token()
+        .map_err(|err| missing("this device's Microsoft session", err))?;
     let Token::Legacy(dev_token) = dev_token else {
         return Err("Invalid STS token".to_string());
     };
-    let user = tokens.get_user().unwrap();
-    let user_token = tokens.get_user_sts_token().unwrap();
+    let user = tokens
+        .get_user()
+        .map_err(|err| missing("the signed-in Microsoft account", err))?;
+    let user_token = tokens
+        .get_user_sts_token()
+        .map_err(|err| missing("the Microsoft account's session token", err))?;
     let Token::Legacy(legacy) = user_token else {
         return Err("Unspported user token".to_string());
     };
@@ -84,7 +104,9 @@ pub async fn get_license(
     let game_splicense = SPLicense::parse_base64(&game_license.splicense_block)
         .expect("could not parse base64 game SPLicense");
 
-    let dev_license = tokens.get_device_license().unwrap();
+    let dev_license = tokens
+        .get_device_license()
+        .map_err(|err| missing("this device's Microsoft license", err))?;
     let device_license = SPLicense::parse_base64(&dev_license.splicense)
         .expect("could not parse base64 device SPLicense");
     let key = device_license
@@ -92,4 +114,84 @@ pub async fn get_license(
         .unwrap()
         .derive_device_key();
     Ok((key, game_splicense))
+}
+
+#[cfg(test)]
+mod tests {
+    use xodus::models::secrets::{LegacyToken, User};
+    use xodus::tokens::PASSPORT_STS;
+
+    use super::*;
+
+    fn legacy() -> Token {
+        Token::Legacy(LegacyToken {
+            key_name: None,
+            token: "token".to_string(),
+            binary_secret: None,
+            tpm_key: None,
+            lifetime: soap::Timestamp {
+                id: None,
+                created: "2026-09-29T00:00:00Z".to_string(),
+                expires: "2026-09-30T00:00:00Z".to_string(),
+            },
+        })
+    }
+
+    async fn license_error(tokens: &TokenManager) -> String {
+        let license = get_license(
+            &reqwest::Client::new(),
+            tokens,
+            "7792d9ce-355a-493c-afbd-768f4a77c3b0".to_string(),
+            "neutral".to_string(),
+        )
+        .await;
+        match license {
+            Ok(_) => panic!("a keyring missing an entry cannot license anything"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_device_without_a_session_asks_for_a_sign_in() {
+        let err = license_error(&TokenManager::with_memory()).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("device's Microsoft session"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_keyring_without_the_account_asks_for_a_sign_in() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_device_token(PASSPORT_STS.to_string(), legacy())
+            .unwrap();
+
+        let err = license_error(&tokens).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("signed-in Microsoft account"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_account_without_its_session_token_asks_for_a_sign_in() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_device_token(PASSPORT_STS.to_string(), legacy())
+            .unwrap();
+        tokens
+            .save_user(&User {
+                puid: "1".to_string(),
+                username: "player@example.com".to_string(),
+            })
+            .unwrap();
+        // A user token for another service is not the Passport one.
+        tokens
+            .save_user_token("http://auth.xboxlive.com".to_string(), legacy())
+            .unwrap();
+
+        let err = license_error(&tokens).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("session token"), "{err}");
+    }
 }

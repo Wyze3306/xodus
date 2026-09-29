@@ -79,11 +79,19 @@ pub async fn get_packages(
     tokens: &TokenManager,
     content_id: String,
 ) -> Result<PackageDetails, Box<dyn std::error::Error>> {
-    let dev_token = tokens.get_device_sts_token().unwrap();
+    let dev_token = tokens.get_device_sts_token().map_err(|err| {
+        std::io::Error::other(format!(
+            "not logged in: this device's Microsoft session is missing from the keyring ({err}); sign in again"
+        ))
+    })?;
     let Token::Legacy(dev_token) = dev_token else {
         return Err(Box::new(std::io::Error::other("Invalid STS token")));
     };
-    let user_token = tokens.get_user_sts_token().unwrap();
+    let user_token = tokens.get_user_sts_token().map_err(|err| {
+        std::io::Error::other(format!(
+            "not logged in: the Microsoft account's session token is missing from the keyring ({err}); sign in again"
+        ))
+    })?;
     let Token::Legacy(legacy) = user_token else {
         return Err(Box::new(std::io::Error::other("Unsupported user token")));
     };
