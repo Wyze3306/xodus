@@ -27,6 +27,33 @@ pub enum LicenseContentError {
     /// than one panicking in a library.
     #[error("the license could not be read: {0}")]
     Unreadable(String),
+
+    /// The service refused the request, e.g. 401 InvalidMsaTicketFormat.
+    #[error("the licensing service refused the request (HTTP {status}): {reason}")]
+    Refused { status: u16, reason: String },
+}
+
+/// The most specific reason a licensing error body gives, or the body itself.
+///
+/// The service answers `{"code": .., "message": .., "innererror": {"code": ..,
+/// "message": ..}}`, and the inner error is the one that says what was wrong.
+fn refusal_reason(body: &str) -> String {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.chars().take(300).collect();
+    };
+    let error = json
+        .get("innererror")
+        .filter(|inner| inner.get("code").is_some())
+        .unwrap_or(&json);
+    match (
+        error.get("code").and_then(|v| v.as_str()),
+        error.get("message").and_then(|v| v.as_str()),
+    ) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => body.chars().take(300).collect(),
+    }
 }
 
 // we might need a bump in xal-rs concerning reqwest,
@@ -67,6 +94,17 @@ pub async fn get_license_content(
         .send()
         .await?;
 
+    // A refusal is a JSON error, not a license: reading it as one used to
+    // surface as "error decoding response body", which named neither the
+    // status nor the reason the service gave.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LicenseContentError::Refused {
+            status: status.as_u16(),
+            reason: refusal_reason(&body),
+        });
+    }
     let content_res = response.json::<LicenseContentResponse>().await?;
     let content = match content_res {
         LicenseContentResponse::Success { license } => license,
@@ -167,6 +205,25 @@ mod tests {
             .expect("failed to read the license");
 
         assert_eq!(license.splicense_block, "AAAA");
+    }
+
+    #[test]
+    fn names_the_inner_reason_of_a_refusal() {
+        let body = r#"{"code":"Unauthorized","innererror":{"faultcode":4003,"code":"InvalidMsaTicketFormat","message":"There was a problem parsing the request since the request had an invalid format for the MSA ticket."},"message":"The client is not authorized to perform the requested operation.","source":"LicensingFD"}"#;
+
+        assert_eq!(
+            refusal_reason(body),
+            "InvalidMsaTicketFormat: There was a problem parsing the request since the request had an invalid format for the MSA ticket."
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_outer_error_and_to_the_raw_body() {
+        assert_eq!(
+            refusal_reason(r#"{"code":"Forbidden","message":"No."}"#),
+            "Forbidden: No."
+        );
+        assert_eq!(refusal_reason("<html>busy</html>"), "<html>busy</html>");
     }
 
     #[test]
