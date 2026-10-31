@@ -367,6 +367,14 @@ fn create_session<T: SessionHandler>(
                     {
                         eprintln!("Failed to dispatch IPC token callback event");
                     }
+                } else if let Some(missing) = unusable_token_bag(body) {
+                    // Any JSON object parses as a HostBridgeMessage, so this
+                    // used to be dropped in silence with the page left on
+                    // "Please wait".
+                    eprintln!(
+                        "Sign-in page returned its tokens without {}; cannot finish the sign-in",
+                        missing.join(", ")
+                    );
                 } else {
                     match serde_json::from_str::<HostBridgeMessage>(body) {
                         Ok(message) => {
@@ -380,6 +388,9 @@ fn create_session<T: SessionHandler>(
                             {
                                 eprintln!("Failed to dispatch host context event");
                             }
+                            if let Some(name) = message.unanswered_invoke() {
+                                eprintln!("Sign-in page is waiting on {name}, which this host does not answer");
+                            }
                         }
                         Err(_) => {
                             eprintln!("Ignoring unsupported IPC payload");
@@ -388,8 +399,14 @@ fn create_session<T: SessionHandler>(
                 }
             })
             .with_on_page_load_handler(move |event, url| {
-                if matches!(event, PageLoadEvent::Finished) && url.starts_with("https://login.live.com/ppsecure/post.srf")
-                {
+                if !matches!(event, PageLoadEvent::Finished) {
+                    return;
+                }
+                // Where a sign-in stopped is the first question about one
+                // that hangs, and nothing else answers it. The path only: a
+                // query string here can carry a flow token.
+                eprintln!("Sign-in page loaded: {}", page_without_query(&url));
+                if url.starts_with("https://login.live.com/ppsecure/post.srf") {
                     proxy.send_event(CustomEvent::Finish(session_id)).ok();
                 }
             });
@@ -408,6 +425,22 @@ fn create_session<T: SessionHandler>(
     Ok(())
 }
 
+/// The missing fields of a `ServerData` that carries sign-in tokens but not
+/// all the ones the exchange needs; None for any other payload.
+fn unusable_token_bag(body: &str) -> Option<Vec<&'static str>> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if !DAProperty::is_token_bag(&value) {
+        return None;
+    }
+    let missing = DAProperty::missing(&value);
+    // Every field present and still unreadable: a type Microsoft changed.
+    Some(if missing.is_empty() { vec!["fields of the expected type"] } else { missing })
+}
+
+fn page_without_query(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 fn remove_session<T: SessionHandler>(state: &mut RuntimeState<T>, session_id: SessionId) {
     if state.active_session == Some(session_id) {
         state.active_session = None;
@@ -418,6 +451,25 @@ fn remove_session<T: SessionHandler>(state: &mut RuntimeState<T>, session_id: Se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_is_logged_without_its_query() {
+        assert_eq!(
+            page_without_query("https://login.live.com/ppsecure/post.srf?uaid=x&ft=secret"),
+            "https://login.live.com/ppsecure/post.srf"
+        );
+        assert_eq!(page_without_query("https://login.live.com/a#b"), "https://login.live.com/a");
+    }
+
+    #[test]
+    fn a_token_bag_short_of_a_field_is_named_and_others_are_not() {
+        assert_eq!(
+            unusable_token_bag(r#"{"sDAToken":"t","sSigninName":"u","K":"1"}"#),
+            Some(vec!["sDAStartTime", "sDAExpires"])
+        );
+        assert_eq!(unusable_token_bag(r#"{"type":"invoke","value":{}}"#), None);
+        assert_eq!(unusable_token_bag("not json"), None);
+    }
 
     /// Every leg of the sign-in has to look like the same host, or the leg
     /// that does not never finishes.
