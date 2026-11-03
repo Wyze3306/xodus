@@ -22,6 +22,23 @@ pub struct LegacyToken {
     pub lifetime: Timestamp,
 }
 
+impl LegacyToken {
+    /// Whether the token's `wsu:Expires` has passed at `now`.
+    ///
+    /// The keyring keeps a Passport STS token for as long as nothing replaces
+    /// it, and login.live.com answers every request signed with an expired one
+    /// with a SOAP Fault. A token is treated as expired a few minutes early so
+    /// a request does not race its own expiry, or the server's clock.
+    /// A lifetime that cannot be read is not called expired: the token is then
+    /// used as before, and the server is the judge.
+    pub fn is_expired_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        match chrono::DateTime::parse_from_rfc3339(&self.lifetime.expires) {
+            Ok(expires) => now + chrono::TimeDelta::minutes(5) >= expires.to_utc(),
+            Err(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Token {
@@ -102,6 +119,52 @@ fn is_jose_compact(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_expiring(expires: &str) -> LegacyToken {
+        LegacyToken {
+            key_name: None,
+            token: "token".to_string(),
+            binary_secret: None,
+            tpm_key: None,
+            lifetime: Timestamp {
+                id: None,
+                created: "2026-09-04T00:00:00Z".to_string(),
+                expires: expires.to_string(),
+            },
+        }
+    }
+
+    fn at(time: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(time).unwrap().to_utc()
+    }
+
+    #[test]
+    fn a_token_past_its_expiry_is_expired() {
+        let token = legacy_expiring("2026-11-03T12:00:00Z");
+        assert!(token.is_expired_at(at("2026-11-03T12:00:01Z")));
+        assert!(token.is_expired_at(at("2026-12-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn a_token_about_to_expire_is_expired() {
+        let token = legacy_expiring("2026-11-03T12:00:00Z");
+        assert!(token.is_expired_at(at("2026-11-03T11:57:00Z")));
+    }
+
+    #[test]
+    fn a_token_within_its_lifetime_is_not_expired() {
+        let token = legacy_expiring("2026-11-03T12:00:00Z");
+        assert!(!token.is_expired_at(at("2026-11-03T11:00:00Z")));
+        // Fractional seconds and an explicit offset are read the same way.
+        let token = legacy_expiring("2026-11-03T12:00:00.1234567+00:00");
+        assert!(!token.is_expired_at(at("2026-11-03T11:00:00Z")));
+    }
+
+    #[test]
+    fn a_lifetime_that_cannot_be_read_is_not_expired() {
+        assert!(!legacy_expiring("").is_expired_at(at("2026-11-03T12:00:00Z")));
+        assert!(!legacy_expiring("soon").is_expired_at(at("2026-11-03T12:00:00Z")));
+    }
 
     #[test]
     fn prefixes_an_opaque_delegation_ticket() {

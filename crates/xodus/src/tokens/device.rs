@@ -5,16 +5,42 @@ use crate::models::devicecredential::{Authentication, ClientInfo, DeviceAddReque
 use crate::models::secrets::Device;
 use crate::models::soap::BodyContent;
 use crate::tokens::manager::TokenManager;
+use crate::tokens::store::TokenStoreError;
 
 /// Provisions a device (if none is stored yet) or re-authenticates an existing one
 /// (if its STS token is missing/expired), persisting the result through `tokens`.
 pub async fn ensure_device_credentials(client: &reqwest::Client, tokens: &TokenManager) {
     match tokens.get_device_license() {
         Err(_) => provision_device(client, tokens).await,
-        Ok(license) if tokens.get_device_sts_token().is_err() => {
-            reauthenticate_device(client, tokens, license).await
-        }
-        Ok(_) => {}
+        Ok(license) => match tokens.get_device_sts_token() {
+            Ok(_) => {}
+            Err(TokenStoreError::Expired(expires)) => {
+                tracing::info!("this device's STS token expired at {expires}; signing it in again");
+                // Every device token was issued to the same lapsed session.
+                drop_device_tokens(tokens);
+                reauthenticate_device(client, tokens, license).await
+            }
+            Err(_) => reauthenticate_device(client, tokens, license).await,
+        },
+    }
+}
+
+/// Signs this device in again, for a session login.live.com refused although
+/// it had not expired by its stored lifetime.
+///
+/// Drops the device tokens and nothing else -- the device (`dev_license`) and
+/// the account stay -- which is the same thing as deleting `device-tokens`
+/// from the keyring by hand, then runs `ensure_device_credentials`. A caller
+/// should retry a refused request once after this, not in a loop: a refusal
+/// a fresh device session does not cure is not a device-session problem.
+pub async fn reauthenticate_device_session(client: &reqwest::Client, tokens: &TokenManager) {
+    drop_device_tokens(tokens);
+    ensure_device_credentials(client, tokens).await;
+}
+
+fn drop_device_tokens(tokens: &TokenManager) {
+    if let Err(err) = tokens.remove_device_tokens() {
+        tracing::debug!("could not remove the device tokens: {err}");
     }
 }
 
