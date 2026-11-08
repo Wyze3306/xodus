@@ -4,7 +4,11 @@ use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::{LegacyToken, Token};
 use xodus::models::soap;
 use xodus::tokens::TokenManager;
+use xodus::tokens::session;
 use xodus::tokens::store::TokenStoreError;
+
+/// The Microsoft Store app Live issues the license request's tickets to.
+const HOST_APP: &str = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
 
 /// What a license request says when the keyring lacks one of the entries it
 /// needs, instead of unwrapping it.
@@ -41,7 +45,7 @@ async fn exchange_device_token(
     xodus::api::live::exchange_device_token(
         client,
         dev_token,
-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+        HOST_APP.to_string(),
         "www.microsoft.com".to_owned(),
         Some(soap::PolicyReference::mbi_ssl()),
     )
@@ -92,6 +96,36 @@ pub async fn get_license(
         }
     };
 
+    // The account's session runs out ninety days after the sign-in that
+    // stored it, and Live renews it without one while it still takes it.
+    // Failing to is no reason to stop: the session in hand has not run out.
+    let legacy = if session::is_ending(&legacy, chrono::Utc::now()) {
+        match session::renew_account_session(
+            client,
+            tokens,
+            legacy.clone(),
+            user.username.clone(),
+            dev_token.clone(),
+            HOST_APP,
+        )
+        .await
+        {
+            Ok(renewed) => {
+                tracing::info!(
+                    "renewed the Microsoft account's session until {}",
+                    renewed.lifetime.expires
+                );
+                renewed
+            }
+            Err(err) => {
+                tracing::warn!("could not renew the Microsoft account's session: {err}");
+                legacy
+            }
+        }
+    } else {
+        legacy
+    };
+
     let user_token = xodus::api::live::exchange_user_token(
         client,
         legacy,
@@ -99,7 +133,7 @@ pub async fn get_license(
         dev_token,
         None,
         Some("Silent".to_string()),
-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+        HOST_APP.to_string(),
         &[(
             "www.microsoft.com".to_owned(),
             Some(soap::PolicyReference::mbi_ssl()),
