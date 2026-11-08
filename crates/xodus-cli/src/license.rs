@@ -52,6 +52,19 @@ async fn exchange_device_token(
     .await
 }
 
+/// Whether signing this device in afresh is worth one more try after `err`.
+///
+/// Live answered, and not with a ticket. A SOAP Fault is what a lapsed or
+/// revoked device session gets; a session Live does not recognise at all is
+/// answered with an envelope the exchange cannot read (`missing field
+/// wsa:Action`), and a session whose secret no longer decrypts the answer
+/// fails in the client. A fresh device session is what cures each of them,
+/// as deleting `device-tokens` by hand did. A request that never got an
+/// answer is the network's, and a new session changes nothing there.
+fn worth_a_fresh_session(err: &RSTError) -> bool {
+    !matches!(err, RSTError::Request(_))
+}
+
 pub async fn get_license(
     client: &reqwest::Client,
     tokens: &TokenManager,
@@ -75,10 +88,9 @@ pub async fn get_license(
     let (dev_token, ms_device_token) = match exchange_device_token(client, dev_token.clone()).await
     {
         Ok(token) => (dev_token, token),
-        Err(RSTError::Fault(status)) => {
+        Err(err) if worth_a_fresh_session(&err) => {
             tracing::warn!(
-                "login.live.com refused this device's session (reqstatus: {}); signing the device in again",
-                status.as_deref().unwrap_or("none")
+                "login.live.com did not exchange this device's session ({err}); signing the device in again"
             );
             xodus::tokens::device::reauthenticate_device_session(client, tokens).await;
             let dev_token = device_sts_token(tokens)?;
@@ -271,6 +283,24 @@ mod tests {
 
         assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
         assert!(err.contains("session token"), "{err}");
+    }
+
+    #[test]
+    fn any_answer_that_is_not_a_ticket_is_worth_a_fresh_session() {
+        assert!(worth_a_fresh_session(&RSTError::Fault(None)));
+        assert!(worth_a_fresh_session(&RSTError::UnexpectedResponse(
+            "encrypted body"
+        )));
+        assert!(worth_a_fresh_session(&RSTError::InvalidResponseSignature(
+            "digest".to_string()
+        )));
+        assert!(worth_a_fresh_session(&RSTError::Decryption));
+    }
+
+    #[test]
+    fn a_request_that_got_no_answer_is_not_worth_a_fresh_session() {
+        let unsent = reqwest::Client::new().get("not a url").build().unwrap_err();
+        assert!(!worth_a_fresh_session(&RSTError::Request(unsent)));
     }
 
     #[tokio::test]
