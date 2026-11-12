@@ -11,6 +11,7 @@ use reqwest::header::RANGE;
 use tokio::fs::OpenOptions;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
+    BufWriter,
 };
 use tokio::task::block_in_place;
 use tokio::time::{sleep, timeout};
@@ -27,6 +28,9 @@ use crate::models::xvd::{
     XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+
+/// How much `extract_file_ex` reads and writes at a time.
+const DECRYPT_IO_BUFFER: usize = 4 << 20;
 
 pub struct SyncSubstream<R> {
     inner: R,
@@ -997,6 +1001,19 @@ impl XvdFile {
         let page_start = file_offset_in_section / PAGE_SIZE as u64;
         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
 
+        // Pages are read and written through buffers of DECRYPT_IO_BUFFER
+        // bytes. Both ends are tokio files in practice, and a tokio file runs
+        // every read and every write as its own task on the blocking pool:
+        // page by page, that was two thread hand-offs per 4 KiB, 160 000 of
+        // them for the 324 MB Minecraft executable `run` decrypts at every
+        // launch. The reader is limited to the pages this file has, so it
+        // never reads ahead into whatever follows them.
+        let mut i = BufReader::with_capacity(
+            DECRYPT_IO_BUFFER,
+            (&mut *i).take(page_count * PAGE_SIZE as u64),
+        );
+        let mut out = BufWriter::with_capacity(DECRYPT_IO_BUFFER, &mut *out);
+
         let mut page = [0u8; PAGE_SIZE];
 
         for page_in_section in page_start..page_start + page_count {
@@ -1043,11 +1060,22 @@ impl XvdFile {
             } else {
                 to_write
             };
+            // A page is smaller than the buffer, so the writer takes all of
+            // it or none of it: an error here leaves nothing half-written,
+            // and retrying the same page is safe.
             while let Err(err) = out.write_all(&page[..to_write]).await {
                 eprintln!("Error write file {} waiting 30s", err);
                 println!("Error write file {} waiting 30s", err);
                 sleep(tokio::time::Duration::from_secs(30)).await;
             }
+        }
+        // Everything is on `out` before this returns: `run` turns it into a
+        // descriptor and hands it to Wine right after, and a tokio file only
+        // reports a failed write to the operation that follows it.
+        while let Err(err) = out.flush().await {
+            eprintln!("Error write file {} waiting 30s", err);
+            println!("Error write file {} waiting 30s", err);
+            sleep(tokio::time::Duration::from_secs(30)).await;
         }
         Ok(())
     }
@@ -1099,6 +1127,7 @@ mod tests {
     use tokio::io::ReadBuf;
 
     use super::*;
+    use crate::crypt::encrypt_page_xts;
 
     /// A reader that counts the bytes read through it.
     struct CountingReader {
@@ -1237,5 +1266,135 @@ mod tests {
         blob.truncate(blob.len() - 2);
         let err = segment_files(&[section()], &blob).err().unwrap();
         assert!(err.to_string().contains("segment path"), "{err}");
+    }
+
+    /// A writer that keeps what it is given and counts the calls reaching it.
+    #[derive(Default)]
+    struct CountingWriter {
+        data: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            self.data.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const FILE_PAGES: u64 = 300;
+    const KEY: [u8; 32] = [7; 32];
+
+    fn xvd_with_section_of(pages: u64) -> XvdFile {
+        let mut buf = XvdHeader::buffer();
+        buf[0x200..0x208].copy_from_slice(b"msft-xvd");
+        // file_time_created: the Unix epoch as a FILETIME.
+        buf[0x210..0x218].copy_from_slice(&116_444_736_000_000_000i64.to_le_bytes());
+        // drive_size: the layout needs something to hash.
+        buf[0x218..0x220].copy_from_slice(&(16u64 << 20).to_le_bytes());
+        let header = XvdHeader::try_from_array(&buf).unwrap();
+        let layout = header.layout();
+        let mut section = section();
+        section.section_length = pages * PAGE_SIZE as u64;
+        XvdFile {
+            header,
+            layout,
+            encrypted_section_infos: vec![section],
+        }
+    }
+
+    /// `pages` pages of plaintext, and the same pages encrypted the way the
+    /// package stores them at the start of the test section.
+    fn plain_and_cipher(pages: u64) -> (Vec<u8>, Vec<u8>) {
+        let plain: Vec<u8> = (0..pages as usize * PAGE_SIZE)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let mut cipher = plain.clone();
+        let tweak = TweakGenerator::new(XvcRegionId::Other(1), Uuid::nil());
+        let tweak_cipher = Aes128Enc::new((&<[u8; 16]>::try_from(&KEY[..16]).unwrap()).into());
+        let data_cipher = Aes128Enc::new((&<[u8; 16]>::try_from(&KEY[16..]).unwrap()).into());
+        for (n, page) in cipher.as_chunks_mut::<PAGE_SIZE>().0.iter_mut().enumerate() {
+            encrypt_page_xts(
+                page,
+                tweak.with_data_unit(n as u32),
+                &tweak_cipher,
+                &data_cipher,
+            );
+        }
+        (plain, cipher)
+    }
+
+    #[tokio::test]
+    async fn mount_mem_fd_decrypts_through_a_few_large_writes() {
+        // Page by page, a file of 300 pages was 300 reads and 300 writes, each
+        // its own blocking-pool task on a tokio file. Through the buffers it
+        // is one write, and flushed before mount_mem_fd returns -- `run`
+        // turns the memfd into a descriptor for Wine right after.
+        let xvd = xvd_with_section_of(FILE_PAGES);
+        let (plain, cipher) = plain_and_cipher(FILE_PAGES);
+        let sfile = SegmentFile {
+            offset: SECTION_OFFSET,
+            length: FILE_PAGES * PAGE_SIZE as u64 - 100,
+            data_hashs: vec![],
+            keep_encrypted: true,
+        };
+        let mut reader = CountingReader {
+            inner: Cursor::new(cipher),
+            read: 0,
+        };
+        let mut out = CountingWriter::default();
+
+        xvd.mount_mem_fd(&mut reader, &mut out, &sfile, KEY, |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(out.data.len() as u64, sfile.length);
+        assert!(out.data == plain[..sfile.length as usize]);
+        assert_eq!(out.writes, 1);
+        assert!(out.flushes >= 1);
+    }
+
+    #[tokio::test]
+    async fn extraction_reads_no_further_than_the_file() {
+        // The reader is the package itself when `streaming` extracts from a
+        // local file, so reading ahead must stop at the file's last page.
+        let xvd = xvd_with_section_of(FILE_PAGES + 8);
+        let (plain, mut cipher) = plain_and_cipher(FILE_PAGES);
+        let file_len = cipher.len() as u64;
+        cipher.extend_from_slice(&[0xEEu8; 8 * PAGE_SIZE]);
+        let sfile = SegmentFile {
+            offset: SECTION_OFFSET,
+            length: file_len,
+            data_hashs: vec![],
+            keep_encrypted: false,
+        };
+        let mut reader = CountingReader {
+            inner: Cursor::new(cipher),
+            read: 0,
+        };
+        let mut out = CountingWriter::default();
+
+        xvd.mount_mem_fd(&mut reader, &mut out, &sfile, KEY, |_, _| {})
+            .await
+            .unwrap();
+
+        assert!(out.data == plain);
+        assert_eq!(reader.read, file_len);
+        assert_eq!(reader.inner.position(), file_len);
     }
 }
