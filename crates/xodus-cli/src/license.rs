@@ -1,8 +1,69 @@
+use xodus::api::live::RSTError;
 use xodus::licensing::splicense::{DeviceKey, SPLicense};
 use xodus::models::live::ExchangeUserTokenOutcome;
-use xodus::models::secrets::Token;
+use xodus::models::secrets::{LegacyToken, Token};
 use xodus::models::soap;
 use xodus::tokens::TokenManager;
+use xodus::tokens::session;
+use xodus::tokens::store::TokenStoreError;
+
+/// The Microsoft Store app Live issues the license request's tickets to.
+const HOST_APP: &str = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
+
+/// What a license request says when the keyring lacks one of the entries it
+/// needs, instead of unwrapping it.
+///
+/// A keyring can hold device tokens and some user tokens without everything a
+/// license request reads -- the account's `user-DA` entry, or its Passport
+/// STS token -- and each lookup used to `unwrap()`, so the caller got
+/// `called Result::unwrap() on an Err value: NotFound` in the middle of a
+/// download, with nothing to say that signing in again is the way out.
+/// "not logged in" is the phrase for that.
+fn missing(what: &str, err: TokenStoreError) -> String {
+    match err {
+        TokenStoreError::Expired(_) => {
+            format!("not logged in: {what} in the keyring has expired ({err}); sign in again")
+        }
+        err => format!("not logged in: {what} is missing from the keyring ({err}); sign in again"),
+    }
+}
+
+fn device_sts_token(tokens: &TokenManager) -> std::result::Result<LegacyToken, String> {
+    let dev_token = tokens
+        .get_device_sts_token()
+        .map_err(|err| missing("this device's Microsoft session", err))?;
+    let Token::Legacy(dev_token) = dev_token else {
+        return Err("Invalid STS token".to_string());
+    };
+    Ok(dev_token)
+}
+
+async fn exchange_device_token(
+    client: &reqwest::Client,
+    dev_token: LegacyToken,
+) -> std::result::Result<soap::RequestSecurityTokenResponse, RSTError> {
+    xodus::api::live::exchange_device_token(
+        client,
+        dev_token,
+        HOST_APP.to_string(),
+        "www.microsoft.com".to_owned(),
+        Some(soap::PolicyReference::mbi_ssl()),
+    )
+    .await
+}
+
+/// Whether signing this device in afresh is worth one more try after `err`.
+///
+/// Live answered, and not with a ticket. A SOAP Fault is what a lapsed or
+/// revoked device session gets; a session Live does not recognise at all is
+/// answered with an envelope the exchange cannot read (`missing field
+/// wsa:Action`), and a session whose secret no longer decrypts the answer
+/// fails in the client. A fresh device session is what cures each of them,
+/// as deleting `device-tokens` by hand did. A request that never got an
+/// answer is the network's, and a new session changes nothing there.
+fn worth_a_fresh_session(err: &RSTError) -> bool {
+    !matches!(err, RSTError::Request(_))
+}
 
 pub async fn get_license(
     client: &reqwest::Client,
@@ -10,25 +71,72 @@ pub async fn get_license(
     content_id: String,
     market: String,
 ) -> std::result::Result<(DeviceKey, SPLicense), String> {
-    let dev_token = tokens.get_device_sts_token().unwrap();
-    let Token::Legacy(dev_token) = dev_token else {
-        return Err("Invalid STS token".to_string());
-    };
-    let user = tokens.get_user().unwrap();
-    let user_token = tokens.get_user_sts_token().unwrap();
+    let dev_token = device_sts_token(tokens)?;
+    let user = tokens
+        .get_user()
+        .map_err(|err| missing("the signed-in Microsoft account", err))?;
+    let user_token = tokens
+        .get_user_sts_token()
+        .map_err(|err| missing("the Microsoft account's session token", err))?;
     let Token::Legacy(legacy) = user_token else {
         return Err("Unspported user token".to_string());
     };
 
-    let ms_device_token = xodus::api::live::exchange_device_token(
-        client,
-        dev_token.clone(),
-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
-        "www.microsoft.com".to_owned(),
-        Some(soap::PolicyReference::mbi_ssl()),
-    )
-    .await
-    .unwrap();
+    // A device session login.live.com refuses is one a fresh sign-in of the
+    // same device cures, which is what deleting `device-tokens` by hand did
+    // (issue #367). Once: a second refusal is reported, not retried.
+    let (dev_token, ms_device_token) = match exchange_device_token(client, dev_token.clone()).await
+    {
+        Ok(token) => (dev_token, token),
+        Err(err) if worth_a_fresh_session(&err) => {
+            tracing::warn!(
+                "login.live.com did not exchange this device's session ({err}); signing the device in again"
+            );
+            xodus::tokens::device::reauthenticate_device_session(client, tokens).await;
+            let dev_token = device_sts_token(tokens)?;
+            let token = exchange_device_token(client, dev_token.clone())
+                .await
+                .map_err(|err| {
+                    format!("this device's Microsoft session was refused again after signing it in afresh: {err}")
+                })?;
+            (dev_token, token)
+        }
+        Err(err) => {
+            return Err(format!(
+                "could not exchange this device's Microsoft session: {err}"
+            ));
+        }
+    };
+
+    // The account's session runs out ninety days after the sign-in that
+    // stored it, and Live renews it without one while it still takes it.
+    // Failing to is no reason to stop: the session in hand has not run out.
+    let legacy = if session::is_ending(&legacy, chrono::Utc::now()) {
+        match session::renew_account_session(
+            client,
+            tokens,
+            legacy.clone(),
+            user.username.clone(),
+            dev_token.clone(),
+            HOST_APP,
+        )
+        .await
+        {
+            Ok(renewed) => {
+                tracing::info!(
+                    "renewed the Microsoft account's session until {}",
+                    renewed.lifetime.expires
+                );
+                renewed
+            }
+            Err(err) => {
+                tracing::warn!("could not renew the Microsoft account's session: {err}");
+                legacy
+            }
+        }
+    } else {
+        legacy
+    };
 
     let user_token = xodus::api::live::exchange_user_token(
         client,
@@ -37,7 +145,7 @@ pub async fn get_license(
         dev_token,
         None,
         Some("Silent".to_string()),
-        "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".to_string(),
+        HOST_APP.to_string(),
         &[(
             "www.microsoft.com".to_owned(),
             Some(soap::PolicyReference::mbi_ssl()),
@@ -84,7 +192,9 @@ pub async fn get_license(
     let game_splicense = SPLicense::parse_base64(&game_license.splicense_block)
         .expect("could not parse base64 game SPLicense");
 
-    let dev_license = tokens.get_device_license().unwrap();
+    let dev_license = tokens
+        .get_device_license()
+        .map_err(|err| missing("this device's Microsoft license", err))?;
     let device_license = SPLicense::parse_base64(&dev_license.splicense)
         .expect("could not parse base64 device SPLicense");
     let key = device_license
@@ -92,4 +202,130 @@ pub async fn get_license(
         .unwrap()
         .derive_device_key();
     Ok((key, game_splicense))
+}
+
+#[cfg(test)]
+mod tests {
+    use xodus::models::secrets::{LegacyToken, User};
+    use xodus::tokens::PASSPORT_STS;
+
+    use super::*;
+
+    fn legacy() -> Token {
+        Token::Legacy(LegacyToken {
+            key_name: None,
+            token: "token".to_string(),
+            binary_secret: None,
+            tpm_key: None,
+            lifetime: soap::Timestamp {
+                id: None,
+                created: "2026-09-29T00:00:00Z".to_string(),
+                // Expired tokens are not handed out, and these tests are
+                // about entries that are missing.
+                expires: "2099-09-30T00:00:00Z".to_string(),
+            },
+        })
+    }
+
+    async fn license_error(tokens: &TokenManager) -> String {
+        let license = get_license(
+            &reqwest::Client::new(),
+            tokens,
+            "7792d9ce-355a-493c-afbd-768f4a77c3b0".to_string(),
+            "neutral".to_string(),
+        )
+        .await;
+        match license {
+            Ok(_) => panic!("a keyring missing an entry cannot license anything"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_device_without_a_session_asks_for_a_sign_in() {
+        let err = license_error(&TokenManager::with_memory()).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("device's Microsoft session"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_keyring_without_the_account_asks_for_a_sign_in() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_device_token(PASSPORT_STS.to_string(), legacy())
+            .unwrap();
+
+        let err = license_error(&tokens).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("signed-in Microsoft account"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_account_without_its_session_token_asks_for_a_sign_in() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_device_token(PASSPORT_STS.to_string(), legacy())
+            .unwrap();
+        tokens
+            .save_user(&User {
+                puid: "1".to_string(),
+                username: "player@example.com".to_string(),
+            })
+            .unwrap();
+        // A user token for another service is not the Passport one.
+        tokens
+            .save_user_token("http://auth.xboxlive.com".to_string(), legacy())
+            .unwrap();
+
+        let err = license_error(&tokens).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("session token"), "{err}");
+    }
+
+    #[test]
+    fn any_answer_that_is_not_a_ticket_is_worth_a_fresh_session() {
+        assert!(worth_a_fresh_session(&RSTError::Fault(None)));
+        assert!(worth_a_fresh_session(&RSTError::UnexpectedResponse(
+            "encrypted body"
+        )));
+        assert!(worth_a_fresh_session(&RSTError::InvalidResponseSignature(
+            "digest".to_string()
+        )));
+        assert!(worth_a_fresh_session(&RSTError::Decryption));
+    }
+
+    #[test]
+    fn a_request_that_got_no_answer_is_not_worth_a_fresh_session() {
+        let unsent = reqwest::Client::new().get("not a url").build().unwrap_err();
+        assert!(!worth_a_fresh_session(&RSTError::Request(unsent)));
+    }
+
+    #[tokio::test]
+    async fn an_expired_account_session_asks_for_a_sign_in() {
+        let tokens = TokenManager::with_memory();
+        tokens
+            .save_device_token(PASSPORT_STS.to_string(), legacy())
+            .unwrap();
+        tokens
+            .save_user(&User {
+                puid: "1".to_string(),
+                username: "player@example.com".to_string(),
+            })
+            .unwrap();
+        let Token::Legacy(mut expired) = legacy() else {
+            unreachable!()
+        };
+        expired.lifetime.expires = "2026-09-30T00:00:00Z".to_string();
+        tokens
+            .save_user_token(PASSPORT_STS.to_string(), Token::Legacy(expired))
+            .unwrap();
+
+        let err = license_error(&tokens).await;
+
+        assert!(err.starts_with("not logged in:"), "unexpected error: {err}");
+        assert!(err.contains("has expired"), "{err}");
+    }
 }

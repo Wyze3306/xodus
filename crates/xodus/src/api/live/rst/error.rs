@@ -25,6 +25,15 @@ pub enum RSTError {
     Utf8(#[from] std::str::Utf8Error),
     #[error("The signature verification failed - {0}")]
     InvalidResponseSignature(String),
+    /// login.live.com refused the request. For a request signed with a
+    /// device token this is what a lapsed or revoked device session gets.
+    #[error(
+        "login.live.com refused the token request with a SOAP Fault (reqstatus: {})",
+        .0.as_deref().unwrap_or("none")
+    )]
+    Fault(Option<String>),
+    #[error("login.live.com answered the token request with an unexpected {0}")]
+    UnexpectedResponse(&'static str),
 }
 
 #[derive(thiserror::Error, Debug)]

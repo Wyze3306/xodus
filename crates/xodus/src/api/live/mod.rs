@@ -10,6 +10,8 @@ use crate::models::soap;
 mod rst;
 mod utils;
 
+pub use rst::RSTError;
+
 pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
 
 pub async fn login_device_credential(
@@ -70,13 +72,36 @@ pub async fn exchange_device_token(
 
     let envelope = request.request(client).await?;
 
+    single_security_token(envelope)
+}
+
+/// The one token a device token exchange asks for, or why there is none.
+///
+/// A Fault is what login.live.com sends for a device token it no longer
+/// accepts, and it used to reach `unimplemented!` here -- a panic in the
+/// middle of a license request, for something signing the device in again
+/// fixes.
+fn single_security_token(
+    envelope: soap::Envelope,
+) -> Result<soap::RequestSecurityTokenResponse, rst::RSTError> {
     match envelope.body.body {
         soap::BodyContent::RequestSecurityTokenResponse(res) => Ok(*res),
         soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection) => {
-            let token = collection.security_tokens.remove(0);
-            Ok(token)
+            if collection.security_tokens.is_empty() {
+                return Err(rst::RSTError::UnexpectedResponse("empty token collection"));
+            }
+            Ok(collection.security_tokens.remove(0))
         }
-        b => unimplemented!("Exchange token supports only singular token right now {b:?}"),
+        soap::BodyContent::Fault(_) => Err(rst::RSTError::Fault(
+            envelope.header.pp.and_then(|pp| pp.req_status),
+        )),
+        soap::BodyContent::EncryptedData(_) => {
+            Err(rst::RSTError::UnexpectedResponse("encrypted body"))
+        }
+        soap::BodyContent::RequestSecurityToken(_)
+        | soap::BodyContent::RequestMultipleSecurityTokens(_) => {
+            Err(rst::RSTError::UnexpectedResponse("token request"))
+        }
     }
 }
 
@@ -127,6 +152,49 @@ pub async fn exchange_user_token(
         soap::BodyContent::Fault(_) => ExchangeUserTokenOutcome::Fault(envelope.header.pp),
         body => ExchangeUserTokenOutcome::Issued(body),
     })
+}
+
+#[cfg(test)]
+mod faults {
+    use super::{rst::RSTError, single_security_token};
+    use crate::models::soap;
+
+    fn envelope(body: soap::BodyContent, pp: Option<soap::PP>) -> soap::Envelope {
+        let mut header = soap::Header::new();
+        header.pp = pp;
+        soap::Envelope::new(header, soap::Body { body })
+    }
+
+    #[test]
+    fn a_fault_is_an_error_not_a_panic() {
+        // Any status: it is only carried into the message.
+        let pp = soap::PP {
+            xmlns_psf: None,
+            server_version: None,
+            req_status: Some("0x80048821".to_string()),
+            inline_auth_url: None,
+            inline_end_auth_url: None,
+            auth_state_internal: None,
+            user_session_key: None,
+        };
+        let err =
+            single_security_token(envelope(soap::BodyContent::Fault(soap::Fault {}), Some(pp)))
+                .unwrap_err();
+
+        assert!(
+            matches!(&err, RSTError::Fault(Some(status)) if status == "0x80048821"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("SOAP Fault"), "{err}");
+    }
+
+    #[test]
+    fn a_fault_without_a_status_is_still_a_fault() {
+        let err = single_security_token(envelope(soap::BodyContent::Fault(soap::Fault {}), None))
+            .unwrap_err();
+
+        assert!(matches!(err, RSTError::Fault(None)), "{err:?}");
+    }
 }
 
 #[cfg(test)]

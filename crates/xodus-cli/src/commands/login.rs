@@ -77,7 +77,7 @@ impl LoginHandler {
         let device_token = self.device.clone();
         let client_id = self.client_id.clone();
         let username = prop.username;
-        let inline_ft = prop.sts_inline_flow_token;
+        let inline_ft = prop.sts_inline_flow_token.filter(|token| !token.is_empty());
         let user_token = xodus::models::secrets::LegacyToken {
             key_name: None,
             token: prop.da_token,
@@ -106,7 +106,7 @@ impl LoginHandler {
                     user_token,
                     username,
                     device_token,
-                    Some(inline_ft),
+                    inline_ft,
                     None,
                     client_id,
                     &scopes,

@@ -172,6 +172,14 @@ pub struct Binding {
     pub lease_required: Option<String>,
 }
 
+/// The kind of entitlement a license was issued for.
+///
+/// The licensing service names types this list does not: `Trial` comes back
+/// for an entitlement that is time limited rather than owned outright, and
+/// there is no published set to close the list against. Nothing reads the
+/// type -- what a license is wanted for is the SPLicenseBlock beside it --
+/// so an unfamiliar one is kept as it was written rather than costing the
+/// license it belongs to.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
 pub enum LicenseType {
@@ -179,13 +187,20 @@ pub enum LicenseType {
     User,
     Full,
     KeyHolder,
+    Trial,
+    #[serde(untagged)]
+    Other(String),
 }
 
+/// Whether a license may be used offline. Open for the same reason as
+/// [`LicenseType`].
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
 pub enum LicenseUsage {
     Online,
     Offline,
+    #[serde(untagged)]
+    Other(String),
 }
 
 #[derive(Deserialize, Debug)]
@@ -201,4 +216,58 @@ pub struct ServerInfo {
     pub server_time: String,
     #[serde(rename = "$value")]
     pub id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content_license(license_info: &str) -> String {
+        format!(
+            r#"<License>
+                 <SPLicenseBlock>AAAA</SPLicenseBlock>
+                 {license_info}
+                 <Binding Binding_Type="Content">
+                   <ProductID>9NBLGGH2JHXJ</ProductID>
+                 </Binding>
+               </License>"#
+        )
+    }
+
+    #[test]
+    fn license_reads_a_trial_type() {
+        let xml = content_license(r#"<LicenseInfo Type="Trial" LicenseUsage="Online"/>"#);
+
+        let license: License = quick_xml::de::from_str(&xml).expect("failed to read license");
+
+        assert!(matches!(
+            license.license_info.license_type,
+            LicenseType::Trial
+        ));
+        assert_eq!(license.splicense_block, "AAAA");
+    }
+
+    #[test]
+    fn license_keeps_a_type_it_does_not_name() {
+        let xml = content_license(r#"<LicenseInfo Type="Subscription" LicenseUsage="Online"/>"#);
+
+        let license: License = quick_xml::de::from_str(&xml).expect("failed to read license");
+
+        match license.license_info.license_type {
+            LicenseType::Other(ref name) => assert_eq!(name, "Subscription"),
+            ref other => panic!("expected the type to be kept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn license_keeps_a_usage_it_does_not_name() {
+        let xml = content_license(r#"<LicenseInfo Type="Full" LicenseUsage="Metered"/>"#);
+
+        let license: License = quick_xml::de::from_str(&xml).expect("failed to read license");
+
+        match license.license_info.license_usage {
+            Some(LicenseUsage::Other(ref name)) => assert_eq!(name, "Metered"),
+            ref other => panic!("expected the usage to be kept, got {other:?}"),
+        }
+    }
 }

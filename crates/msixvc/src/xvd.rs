@@ -1,5 +1,5 @@
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 
@@ -11,12 +11,12 @@ use reqwest::header::RANGE;
 use tokio::fs::OpenOptions;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
+    BufWriter,
 };
 use tokio::task::block_in_place;
 use tokio::time::{sleep, timeout};
 use tokio_util::io::SyncIoBridge;
 use uuid::Uuid;
-use zerocopy::IntoBytes;
 
 use crate::crypt::{TweakGenerator, decrypt_page_xts};
 use crate::layout::{Bytes, PAGE_SIZE, PAGES_PER_BLOCK, Pages};
@@ -28,6 +28,9 @@ use crate::models::xvd::{
     XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+
+/// How much `extract_file_ex` reads and writes at a time.
+const DECRYPT_IO_BUFFER: usize = 4 << 20;
 
 pub struct SyncSubstream<R> {
     inner: R,
@@ -169,6 +172,107 @@ impl Debug for XvdEncryptionInfo {
     }
 }
 
+/// Reads its inner reader a whole block at a time, keeps the last few blocks,
+/// and seeks without touching it.
+///
+/// The NTFS walk in `parse_ntfs_segment_metadata` reads the package a file
+/// record at a time, and `XvdStream` asks for the stream position before
+/// every read. Through a `SyncIoBridge` on a tokio file, each of those was a
+/// task on tokio's blocking pool: 31 000 reads and 60 000 seeks for a
+/// Minecraft package, most of a second of every launch.
+struct BlockCache<R> {
+    inner: R,
+    pos: u64,
+    /// Most recently used first.
+    blocks: VecDeque<CachedBlock>,
+}
+
+struct CachedBlock {
+    index: u64,
+    data: Vec<u8>,
+}
+
+impl<R> BlockCache<R> {
+    const BLOCK: u64 = 256 << 10;
+    const BLOCKS: usize = 16;
+
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pos: 0,
+            blocks: VecDeque::with_capacity(Self::BLOCKS),
+        }
+    }
+}
+
+impl<R: Read + Seek> BlockCache<R> {
+    /// Block `index`, read from the inner reader unless it is cached. Only
+    /// the last block of the inner reader is shorter than `BLOCK`.
+    fn block(&mut self, index: u64) -> io::Result<&[u8]> {
+        match self.blocks.iter().position(|b| b.index == index) {
+            Some(0) => (),
+            Some(at) => {
+                let block = self.blocks.remove(at).expect("position is in range");
+                self.blocks.push_front(block);
+            }
+            None => {
+                self.inner.seek(SeekFrom::Start(index * Self::BLOCK))?;
+                let mut data = vec![0u8; Self::BLOCK as usize];
+                let mut filled = 0;
+                while filled < data.len() {
+                    match self.inner.read(&mut data[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => (),
+                        Err(err) => return Err(err),
+                    }
+                }
+                data.truncate(filled);
+                if self.blocks.len() == Self::BLOCKS {
+                    self.blocks.pop_back();
+                }
+                self.blocks.push_front(CachedBlock { index, data });
+            }
+        }
+        Ok(&self.blocks[0].data)
+    }
+}
+
+impl<R: Read + Seek> Read for BlockCache<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut done = 0;
+        while done < buf.len() {
+            let index = self.pos / Self::BLOCK;
+            let offset = (self.pos % Self::BLOCK) as usize;
+            let n = {
+                let block = self.block(index)?;
+                if offset >= block.len() {
+                    break;
+                }
+                let n = (block.len() - offset).min(buf.len() - done);
+                buf[done..done + n].copy_from_slice(&block[offset..offset + n]);
+                n
+            };
+            done += n;
+            self.pos += n as u64;
+        }
+        Ok(done)
+    }
+}
+
+impl<R: Seek> Seek for BlockCache<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(n) => n,
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta).ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "invalid seek before the start")
+            })?,
+            SeekFrom::End(_) => self.inner.seek(pos)?,
+        };
+        Ok(self.pos)
+    }
+}
+
 struct XvdStream<R> {
     inner: R,
     offset: u64,
@@ -301,6 +405,114 @@ pub struct SegmentFile {
     pub length: u64,
     pub data_hashs: Vec<[u8; 20]>,
     pub keep_encrypted: bool,
+}
+
+/// Reads the whole `SegmentMetadata.bin` blob in one go.
+///
+/// Everything [`segment_files`] looks up lies inside it, so this is the only
+/// read the segment table needs. It used to be read through a `BufReader` as
+/// large as the blob, seeking to each segment's path in turn, and every seek
+/// empties a tokio `BufReader`: each of the several thousand paths in a
+/// Minecraft package refilled all 1.7 MiB of it, gigabytes of reads for one
+/// table, which is seconds at every `run` and every `streaming`.
+async fn read_segment_metadata<Reader>(
+    mut file: Reader,
+    segment_metadata: &UserPackageFile,
+) -> io::Result<Vec<u8>>
+where
+    Reader: AsyncRead + AsyncSeek + Unpin,
+{
+    let length = usize::try_from(segment_metadata.length)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "segment metadata too large"))?;
+    let mut blob = vec![0u8; length];
+    file.seek(SeekFrom::Start(segment_metadata.offset)).await?;
+    file.read_exact(&mut blob).await?;
+    Ok(blob)
+}
+
+/// `blob[start..start + len]`, or an error naming what did not fit.
+fn metadata_slice<'a>(blob: &'a [u8], start: u64, len: u64, what: &str) -> io::Result<&'a [u8]> {
+    let end = start.checked_add(len);
+    match end {
+        Some(end) if end <= blob.len() as u64 => Ok(&blob[start as usize..end as usize]),
+        _ => Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!(
+                "segment metadata ends at {} bytes, before the {} at {}..{}",
+                blob.len(),
+                what,
+                start,
+                start.saturating_add(len)
+            ),
+        )),
+    }
+}
+
+/// The segment table of `SegmentMetadata.bin`, read from the blob in memory.
+fn segment_files(
+    sections: &[EncryptedSectionInfo],
+    blob: &[u8],
+) -> Result<HashMap<String, SegmentFile>, Box<dyn std::error::Error>> {
+    let header_len = XvdSegmentMetadataHeader::SIZE as u64;
+    let segment_header =
+        XvdSegmentMetadataHeader::try_from_slice(metadata_slice(blob, 0, header_len, "header")?)?;
+    let paths_offset =
+        segment_header.header_length as u64 + segment_header.segment_count as u64 * 0x10;
+
+    let segment_len = XvdSegmentMetadataSegment::SIZE as u64;
+    let mut segments = Vec::with_capacity(segment_header.segment_count as usize);
+    for n in 0..segment_header.segment_count as u64 {
+        let raw = metadata_slice(blob, header_len + n * segment_len, segment_len, "segment")?;
+        segments.push(XvdSegmentMetadataSegment::from_slice(raw));
+    }
+
+    let mut files = HashMap::new();
+
+    for section in sections {
+        let segment_page_start = section.section_offset.div_ceil(PAGE_SIZE as u64);
+        let mut page_offset = segment_page_start;
+        for segment_no in section.first_segment_index..segment_header.segment_count {
+            let segment = &segments[segment_no as usize];
+            let raw = metadata_slice(
+                blob,
+                paths_offset + segment.path_offset as u64,
+                segment.path_length as u64 * 2,
+                "segment path",
+            )?;
+            let units: Vec<u16> = raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect();
+            let file_name = String::from_utf16(&units)?;
+            let page_length = if segment.filesize == 0 {
+                1
+            } else {
+                segment.filesize.div_ceil(PAGE_SIZE as u64)
+            };
+            if page_offset * (PAGE_SIZE as u64) >= section.section_offset + section.section_length {
+                break;
+            }
+            let end = page_offset as usize - segment_page_start as usize
+                + segment.filesize.div_ceil(PAGE_SIZE as u64) as usize;
+            let data_hashs: Vec<[u8; 20]> =
+                section.data_hashs[page_offset as usize - segment_page_start as usize..end].into();
+            files.insert(
+                file_name,
+                SegmentFile {
+                    offset: page_offset * PAGE_SIZE as u64,
+                    length: segment.filesize,
+                    data_hashs,
+                    keep_encrypted: segment
+                        .flags
+                        .contains(XvdSegmentMetadataSegmentFlags::KEEP_ENCRYPTED_ON_DISK),
+                },
+            );
+            page_offset += page_length;
+        }
+    }
+    Ok(files)
 }
 
 impl XvdFile {
@@ -499,70 +711,8 @@ impl XvdFile {
     where
         Reader: AsyncRead + AsyncSeek + Unpin,
     {
-        let mut file = BufReader::with_capacity(segment_metadata.length as usize, file);
-        file.seek(SeekFrom::Start(segment_metadata.offset)).await?;
-        let segment_header = {
-            let mut buf = XvdSegmentMetadataHeader::buffer();
-            file.read_exact(&mut buf).await?;
-            XvdSegmentMetadataHeader::try_from_array(&buf)?
-        };
-        let paths_offset =
-            segment_header.header_length as u64 + segment_header.segment_count as u64 * 0x10;
-
-        let mut segments = Vec::with_capacity(segment_header.segment_count as usize);
-        let mut buf = XvdSegmentMetadataSegment::buffer();
-        for _ in 0..segment_header.segment_count {
-            file.read_exact(&mut buf).await?;
-            let segment = XvdSegmentMetadataSegment::from_array(&buf);
-            segments.push(segment);
-        }
-
-        let mut files = HashMap::new();
-
-        for section in &self.encrypted_section_infos {
-            let segment_page_start = section.section_offset.div_ceil(PAGE_SIZE as u64);
-            let mut page_offset = segment_page_start;
-            for segment_no in section.first_segment_index..segment_header.segment_count {
-                let segment = &segments[segment_no as usize];
-                let s = segment.path_length;
-                let mut buf = vec![0u16, 0];
-                buf.resize(s as usize, 0);
-                file.seek(SeekFrom::Start(
-                    segment_metadata.offset + paths_offset + segment.path_offset as u64,
-                ))
-                .await?;
-                file.read_exact(buf.as_mut_bytes()).await?;
-                let file_name: String = String::from_utf16(buf.as_slice()).unwrap();
-                let page_length = if segment.filesize == 0 {
-                    1
-                } else {
-                    segment.filesize.div_ceil(PAGE_SIZE as u64)
-                };
-                if page_offset * (PAGE_SIZE as u64)
-                    >= section.section_offset + section.section_length
-                {
-                    break;
-                }
-                let end = page_offset as usize - segment_page_start as usize
-                    + segment.filesize.div_ceil(PAGE_SIZE as u64) as usize;
-                let data_hashs: Vec<[u8; 20]> = section.data_hashs
-                    [page_offset as usize - segment_page_start as usize..end]
-                    .into();
-                files.insert(
-                    file_name,
-                    SegmentFile {
-                        offset: page_offset * PAGE_SIZE as u64,
-                        length: segment.filesize,
-                        data_hashs,
-                        keep_encrypted: segment
-                            .flags
-                            .contains(XvdSegmentMetadataSegmentFlags::KEEP_ENCRYPTED_ON_DISK),
-                    },
-                );
-                page_offset += page_length;
-            }
-        }
-        Ok(files)
+        let blob = read_segment_metadata(file, segment_metadata).await?;
+        segment_files(&self.encrypted_section_infos, &blob)
     }
 
     pub fn populate_segment_hashes(
@@ -646,7 +796,7 @@ impl XvdFile {
             let block_size = 4096;
             let drive = SyncSubstream::new(
                 XvdStream {
-                    inner: SyncIoBridge::new(file),
+                    inner: BlockCache::new(SyncIoBridge::new(file)),
                     offset: drive_data_offset,
                     end_offset: drive_data_offset + drive_plain_len,
                     encryption_info: None,
@@ -952,6 +1102,19 @@ impl XvdFile {
         let page_start = file_offset_in_section / PAGE_SIZE as u64;
         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
 
+        // Pages are read and written through buffers of DECRYPT_IO_BUFFER
+        // bytes. Both ends are tokio files in practice, and a tokio file runs
+        // every read and every write as its own task on the blocking pool:
+        // page by page, that was two thread hand-offs per 4 KiB, 160 000 of
+        // them for the 324 MB Minecraft executable `run` decrypts at every
+        // launch. The reader is limited to the pages this file has, so it
+        // never reads ahead into whatever follows them.
+        let mut i = BufReader::with_capacity(
+            DECRYPT_IO_BUFFER,
+            (&mut *i).take(page_count * PAGE_SIZE as u64),
+        );
+        let mut out = BufWriter::with_capacity(DECRYPT_IO_BUFFER, &mut *out);
+
         let mut page = [0u8; PAGE_SIZE];
 
         for page_in_section in page_start..page_start + page_count {
@@ -998,11 +1161,22 @@ impl XvdFile {
             } else {
                 to_write
             };
+            // A page is smaller than the buffer, so the writer takes all of
+            // it or none of it: an error here leaves nothing half-written,
+            // and retrying the same page is safe.
             while let Err(err) = out.write_all(&page[..to_write]).await {
                 eprintln!("Error write file {} waiting 30s", err);
                 println!("Error write file {} waiting 30s", err);
                 sleep(tokio::time::Duration::from_secs(30)).await;
             }
+        }
+        // Everything is on `out` before this returns: `run` turns it into a
+        // descriptor and hands it to Wine right after, and a tokio file only
+        // reports a failed write to the operation that follows it.
+        while let Err(err) = out.flush().await {
+            eprintln!("Error write file {} waiting 30s", err);
+            println!("Error write file {} waiting 30s", err);
+            sleep(tokio::time::Duration::from_secs(30)).await;
         }
         Ok(())
     }
@@ -1042,5 +1216,374 @@ impl XvdFile {
     {
         self.extract_file_ex(i, out, sfile, full_key, progress, true)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::ReadBuf;
+
+    use super::*;
+    use crate::crypt::encrypt_page_xts;
+
+    /// A reader that counts the bytes read through it.
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        read: u64,
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let this = &mut *self;
+            let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+            this.read += (buf.filled().len() - before) as u64;
+            res
+        }
+    }
+
+    impl AsyncSeek for CountingReader {
+        fn start_seek(mut self: Pin<&mut Self>, pos: SeekFrom) -> io::Result<()> {
+            Pin::new(&mut self.inner).start_seek(pos)
+        }
+
+        fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+            Pin::new(&mut self.inner).poll_complete(cx)
+        }
+    }
+
+    const SECTION_OFFSET: u64 = 16 * PAGE_SIZE as u64;
+    const SECTION_PAGES: u64 = 8;
+
+    fn section() -> EncryptedSectionInfo {
+        EncryptedSectionInfo {
+            section_offset: SECTION_OFFSET,
+            section_length: SECTION_PAGES * PAGE_SIZE as u64,
+            header_id: XvcRegionId::Other(1),
+            vduid: Uuid::nil(),
+            data_units: None,
+            first_segment_index: 0,
+            data_hashs: (0..SECTION_PAGES as u8).map(|n| [n; 20]).collect(),
+        }
+    }
+
+    /// A `SegmentMetadata.bin` for `(flags, path, filesize)` segments.
+    fn metadata_blob(segments: &[(u16, &str, u64)]) -> Vec<u8> {
+        let mut paths: Vec<u8> = Vec::new();
+        let mut table: Vec<u8> = Vec::new();
+        for (flags, path, filesize) in segments {
+            let units: Vec<u16> = path.encode_utf16().collect();
+            table.extend_from_slice(&flags.to_le_bytes());
+            table.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            table.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+            table.extend_from_slice(&filesize.to_le_bytes());
+            for unit in units {
+                paths.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b" PFX");
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&(XvdSegmentMetadataHeader::SIZE as u32).to_le_bytes());
+        blob.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&[0u8; 16]);
+        blob.extend_from_slice(&[0u8; 0x3c]);
+        assert_eq!(blob.len(), XvdSegmentMetadataHeader::SIZE);
+        blob.extend_from_slice(&table);
+        blob.extend_from_slice(&paths);
+        blob
+    }
+
+    fn sample_blob() -> Vec<u8> {
+        metadata_blob(&[
+            (1, "\\Game.exe", 5000),
+            (0, "\\empty.txt", 0),
+            (0, "\\Café\\data.bin", 4096),
+        ])
+    }
+
+    #[test]
+    fn segment_files_reads_the_table_from_the_blob() {
+        let files = segment_files(&[section()], &sample_blob()).unwrap();
+        assert_eq!(files.len(), 3);
+
+        let exe = &files["\\Game.exe"];
+        assert_eq!(exe.offset, SECTION_OFFSET);
+        assert_eq!(exe.length, 5000);
+        assert_eq!(exe.data_hashs, vec![[0; 20], [1; 20]]);
+        assert!(exe.keep_encrypted);
+
+        let empty = &files["\\empty.txt"];
+        assert_eq!(empty.offset, SECTION_OFFSET + 2 * PAGE_SIZE as u64);
+        assert_eq!(empty.length, 0);
+        assert!(empty.data_hashs.is_empty());
+        assert!(!empty.keep_encrypted);
+
+        let data = &files["\\Café\\data.bin"];
+        assert_eq!(data.offset, SECTION_OFFSET + 3 * PAGE_SIZE as u64);
+        assert_eq!(data.data_hashs, vec![[3; 20]]);
+    }
+
+    #[tokio::test]
+    async fn segment_metadata_is_read_once() {
+        // Each segment path used to be a seek plus a refill of a BufReader as
+        // large as the whole blob, so a table of n segments read the blob n
+        // more times. Garbage around the blob stands for the rest of the
+        // package, which none of this may read.
+        let blob = sample_blob();
+        let offset = 3 * PAGE_SIZE as u64 + 17;
+        let mut package = vec![0xA5u8; offset as usize];
+        package.extend_from_slice(&blob);
+        package.extend_from_slice(&[0x5Au8; 3 * PAGE_SIZE]);
+        let mut reader = CountingReader {
+            inner: Cursor::new(package),
+            read: 0,
+        };
+        let entry = UserPackageFile {
+            offset,
+            length: blob.len() as u64,
+        };
+
+        let read = read_segment_metadata(&mut reader, &entry).await.unwrap();
+
+        assert_eq!(read, blob);
+        assert_eq!(reader.read, blob.len() as u64);
+        assert_eq!(segment_files(&[section()], &read).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_path_past_the_blob_is_an_error() {
+        let mut blob = sample_blob();
+        blob.truncate(blob.len() - 2);
+        let err = segment_files(&[section()], &blob).err().unwrap();
+        assert!(err.to_string().contains("segment path"), "{err}");
+    }
+
+    /// A writer that keeps what it is given and counts the calls reaching it.
+    #[derive(Default)]
+    struct CountingWriter {
+        data: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            self.data.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const FILE_PAGES: u64 = 300;
+    const KEY: [u8; 32] = [7; 32];
+
+    fn xvd_with_section_of(pages: u64) -> XvdFile {
+        let mut buf = XvdHeader::buffer();
+        buf[0x200..0x208].copy_from_slice(b"msft-xvd");
+        // file_time_created: the Unix epoch as a FILETIME.
+        buf[0x210..0x218].copy_from_slice(&116_444_736_000_000_000i64.to_le_bytes());
+        // drive_size: the layout needs something to hash.
+        buf[0x218..0x220].copy_from_slice(&(16u64 << 20).to_le_bytes());
+        let header = XvdHeader::try_from_array(&buf).unwrap();
+        let layout = header.layout();
+        let mut section = section();
+        section.section_length = pages * PAGE_SIZE as u64;
+        XvdFile {
+            header,
+            layout,
+            encrypted_section_infos: vec![section],
+        }
+    }
+
+    /// `pages` pages of plaintext, and the same pages encrypted the way the
+    /// package stores them at the start of the test section.
+    fn plain_and_cipher(pages: u64) -> (Vec<u8>, Vec<u8>) {
+        let plain: Vec<u8> = (0..pages as usize * PAGE_SIZE)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let mut cipher = plain.clone();
+        let tweak = TweakGenerator::new(XvcRegionId::Other(1), Uuid::nil());
+        let tweak_cipher = Aes128Enc::new((&<[u8; 16]>::try_from(&KEY[..16]).unwrap()).into());
+        let data_cipher = Aes128Enc::new((&<[u8; 16]>::try_from(&KEY[16..]).unwrap()).into());
+        for (n, page) in cipher.as_chunks_mut::<PAGE_SIZE>().0.iter_mut().enumerate() {
+            encrypt_page_xts(
+                page,
+                tweak.with_data_unit(n as u32),
+                &tweak_cipher,
+                &data_cipher,
+            );
+        }
+        (plain, cipher)
+    }
+
+    #[tokio::test]
+    async fn mount_mem_fd_decrypts_through_a_few_large_writes() {
+        // Page by page, a file of 300 pages was 300 reads and 300 writes, each
+        // its own blocking-pool task on a tokio file. Through the buffers it
+        // is one write, and flushed before mount_mem_fd returns -- `run`
+        // turns the memfd into a descriptor for Wine right after.
+        let xvd = xvd_with_section_of(FILE_PAGES);
+        let (plain, cipher) = plain_and_cipher(FILE_PAGES);
+        let sfile = SegmentFile {
+            offset: SECTION_OFFSET,
+            length: FILE_PAGES * PAGE_SIZE as u64 - 100,
+            data_hashs: vec![],
+            keep_encrypted: true,
+        };
+        let mut reader = CountingReader {
+            inner: Cursor::new(cipher),
+            read: 0,
+        };
+        let mut out = CountingWriter::default();
+
+        xvd.mount_mem_fd(&mut reader, &mut out, &sfile, KEY, |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(out.data.len() as u64, sfile.length);
+        assert!(out.data == plain[..sfile.length as usize]);
+        assert_eq!(out.writes, 1);
+        assert!(out.flushes >= 1);
+    }
+
+    #[tokio::test]
+    async fn extraction_reads_no_further_than_the_file() {
+        // The reader is the package itself when `streaming` extracts from a
+        // local file, so reading ahead must stop at the file's last page.
+        let xvd = xvd_with_section_of(FILE_PAGES + 8);
+        let (plain, mut cipher) = plain_and_cipher(FILE_PAGES);
+        let file_len = cipher.len() as u64;
+        cipher.extend_from_slice(&[0xEEu8; 8 * PAGE_SIZE]);
+        let sfile = SegmentFile {
+            offset: SECTION_OFFSET,
+            length: file_len,
+            data_hashs: vec![],
+            keep_encrypted: false,
+        };
+        let mut reader = CountingReader {
+            inner: Cursor::new(cipher),
+            read: 0,
+        };
+        let mut out = CountingWriter::default();
+
+        xvd.mount_mem_fd(&mut reader, &mut out, &sfile, KEY, |_, _| {})
+            .await
+            .unwrap();
+
+        assert!(out.data == plain);
+        assert_eq!(reader.read, file_len);
+        assert_eq!(reader.inner.position(), file_len);
+    }
+}
+
+// Apart from `tests`: tokio's extension traits there would make every std
+// read and seek below ambiguous.
+#[cfg(test)]
+mod block_cache_tests {
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+    use super::BlockCache;
+    use crate::layout::PAGE_SIZE;
+
+    /// A std reader that counts the calls reaching it.
+    struct CountingStream {
+        inner: Cursor<Vec<u8>>,
+        reads: usize,
+        seeks: usize,
+    }
+
+    impl Read for CountingStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountingStream {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.seeks += 1;
+            self.inner.seek(pos)
+        }
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|n| (n * 7 % 253) as u8).collect()
+    }
+
+    #[test]
+    fn block_cache_reads_what_the_reader_holds() {
+        let block = BlockCache::<()>::BLOCK;
+        let data = pattern(4 * block as usize + 123);
+        let mut plain = Cursor::new(data.clone());
+        let mut cached = BlockCache::new(Cursor::new(data));
+        // Inside a block, across a boundary, back to an evicted block, across
+        // the short last block and past the end.
+        let steps: &[(SeekFrom, usize)] = &[
+            (SeekFrom::Start(10), 100),
+            (SeekFrom::Start(block - 7), 4096),
+            (SeekFrom::Current(-3000), 2 * block as usize),
+            (SeekFrom::Start(0), 1),
+            (SeekFrom::End(-50), 4096),
+            (SeekFrom::Start(4 * block + 200), 10),
+        ];
+        for (seek, len) in steps {
+            let a = plain.seek(*seek).unwrap();
+            let b = cached.seek(*seek).unwrap();
+            assert_eq!(a, b);
+            let mut want = vec![0u8; *len];
+            let mut got = vec![0u8; *len];
+            let n = plain.read(&mut want).unwrap();
+            let m = cached.read(&mut got).unwrap();
+            assert_eq!(n, m, "after {seek:?}");
+            assert!(want[..n] == got[..m], "after {seek:?}");
+            assert_eq!(
+                plain.stream_position().unwrap(),
+                cached.stream_position().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn block_cache_reads_a_block_at_a_time() {
+        // The NTFS walk asks for the position before each small read. Through
+        // the cache, a megabyte of 4 KiB reads is four block reads and no
+        // seek of its own; straight on the reader it was 256 of each.
+        let block = BlockCache::<()>::BLOCK as usize;
+        let mut cached = BlockCache::new(CountingStream {
+            inner: Cursor::new(pattern(4 * block)),
+            reads: 0,
+            seeks: 0,
+        });
+        let mut page = [0u8; PAGE_SIZE];
+        for _ in 0..4 * block / PAGE_SIZE {
+            cached.stream_position().unwrap();
+            cached.read_exact(&mut page).unwrap();
+        }
+        assert_eq!(cached.inner.seeks, 4);
+        assert_eq!(cached.inner.reads, 4);
     }
 }

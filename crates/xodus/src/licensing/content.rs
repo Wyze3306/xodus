@@ -20,6 +20,40 @@ pub enum LicenseContentError {
     /// not covered by the account's current subscription tier).
     #[error("not entitled to this content: {description}")]
     NotEntitled { description: String },
+
+    /// The service answered with something this cannot read a license out of.
+    /// The content key is in there and nowhere else, so there is nothing to
+    /// fall back on -- but a downloader saying so is worth a great deal more
+    /// than one panicking in a library.
+    #[error("the license could not be read: {0}")]
+    Unreadable(String),
+
+    /// The service refused the request, e.g. 401 InvalidMsaTicketFormat.
+    #[error("the licensing service refused the request (HTTP {status}): {reason}")]
+    Refused { status: u16, reason: String },
+}
+
+/// The most specific reason a licensing error body gives, or the body itself.
+///
+/// The service answers `{"code": .., "message": .., "innererror": {"code": ..,
+/// "message": ..}}`, and the inner error is the one that says what was wrong.
+fn refusal_reason(body: &str) -> String {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.chars().take(300).collect();
+    };
+    let error = json
+        .get("innererror")
+        .filter(|inner| inner.get("code").is_some())
+        .unwrap_or(&json);
+    match (
+        error.get("code").and_then(|v| v.as_str()),
+        error.get("message").and_then(|v| v.as_str()),
+    ) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => body.chars().take(300).collect(),
+    }
 }
 
 // we might need a bump in xal-rs concerning reqwest,
@@ -60,6 +94,17 @@ pub async fn get_license_content(
         .send()
         .await?;
 
+    // A refusal is a JSON error, not a license: reading it as one used to
+    // surface as "error decoding response body", which named neither the
+    // status nor the reason the service gave.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(LicenseContentError::Refused {
+            status: status.as_u16(),
+            reason: refusal_reason(&body),
+        });
+    }
     let content_res = response.json::<LicenseContentResponse>().await?;
     let content = match content_res {
         LicenseContentResponse::Success { license } => license,
@@ -71,9 +116,7 @@ pub async fn get_license_content(
             });
         }
     };
-    let license = &content.keys[0].value;
-    let license = BASE64_STANDARD.decode(license).unwrap();
-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
+    let license = read_license(&content)?;
     Ok((content, license))
 }
 
@@ -111,4 +154,96 @@ pub async fn get_license_token(
     let token_resp: LicenseTokenResponse = response.json().await?;
 
     Ok(token_resp.license_token)
+}
+
+/// The license the response carries the content key in.
+///
+/// Base64, then UTF-8, then a license document: three ways for an answer to
+/// be something other than what was expected, and all three used to be
+/// unwrapped in the middle of a download.
+fn read_license(content: &LicenseContent) -> Result<License, LicenseContentError> {
+    let key = content
+        .keys
+        .first()
+        .ok_or_else(|| LicenseContentError::Unreadable("the response carried none".into()))?;
+    let decoded = BASE64_STANDARD
+        .decode(&key.value)
+        .map_err(|err| LicenseContentError::Unreadable(format!("not base64: {err}")))?;
+    let xml = String::from_utf8(decoded)
+        .map_err(|err| LicenseContentError::Unreadable(format!("not text: {err}")))?;
+    quick_xml::de::from_str::<License>(&xml)
+        .map_err(|err| LicenseContentError::Unreadable(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::licensing::LicenseKeys;
+
+    use super::*;
+
+    fn response(keys: Vec<&str>) -> LicenseContent {
+        LicenseContent {
+            keys: keys
+                .into_iter()
+                .map(|value| LicenseKeys {
+                    value: value.to_string(),
+                })
+                .collect(),
+            leases: vec![],
+        }
+    }
+
+    #[test]
+    fn reads_the_license_out_of_the_first_key() {
+        let xml = r#"<License>
+                       <SPLicenseBlock>AAAA</SPLicenseBlock>
+                       <LicenseInfo Type="Trial" LicenseUsage="Online"/>
+                       <Binding Binding_Type="Content"/>
+                     </License>"#;
+
+        let license = read_license(&response(vec![&BASE64_STANDARD.encode(xml)]))
+            .expect("failed to read the license");
+
+        assert_eq!(license.splicense_block, "AAAA");
+    }
+
+    #[test]
+    fn names_the_inner_reason_of_a_refusal() {
+        let body = r#"{"code":"Unauthorized","innererror":{"faultcode":4003,"code":"InvalidMsaTicketFormat","message":"There was a problem parsing the request since the request had an invalid format for the MSA ticket."},"message":"The client is not authorized to perform the requested operation.","source":"LicensingFD"}"#;
+
+        assert_eq!(
+            refusal_reason(body),
+            "InvalidMsaTicketFormat: There was a problem parsing the request since the request had an invalid format for the MSA ticket."
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_outer_error_and_to_the_raw_body() {
+        assert_eq!(
+            refusal_reason(r#"{"code":"Forbidden","message":"No."}"#),
+            "Forbidden: No."
+        );
+        assert_eq!(refusal_reason("<html>busy</html>"), "<html>busy</html>");
+    }
+
+    #[test]
+    fn reports_a_response_with_no_license() {
+        let err = read_license(&response(vec![])).expect_err("expected no license");
+
+        assert!(
+            err.to_string().contains("could not be read"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reports_a_key_that_is_not_a_license() {
+        let err = read_license(&response(vec![&BASE64_STANDARD.encode("<Nope/>")]))
+            .expect_err("expected an unreadable license");
+
+        assert!(
+            err.to_string().contains("could not be read"),
+            "unexpected error: {err}"
+        );
+    }
 }
